@@ -1,0 +1,23 @@
+{
+  "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+  "torch": "2.8.0+cu128",
+  "total_device_bytes": 25153044480,
+  "allocator_cap_gib": 8.0,
+  "runs": [
+    {
+      "peak_allocated_bytes": 6057103360,
+      "peak_reserved_bytes": 7474249728,
+      "image": "shadow-benchmark-images/shadow-1.png"
+    },
+    {
+      "peak_allocated_bytes": 6057103360,
+      "peak_reserved_bytes": 7474249728,
+      "image": "shadow-benchmark-images/shadow-2.png"
+    }
+  ],
+  "status": "passed",
+  "note": "Cumulative peaks include initialization. Allocator cap excludes driver allocations; not physical 8GB hardware validation.",
+  "seconds": 214.63555079186335,
+  "peak_allocated_bytes": 6057103360,
+  "peak_reserved_bytes": 7474249728
+}
