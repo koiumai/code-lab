@@ -1,5 +1,26 @@
 # Measurements and verification
 
+## RTX 2080 / Turing compatibility update
+
+A new automatic pre-Ampere CUDA path uses FP32 weights with sequential CPU
+offload and 128-query attention chunks, instead of requiring unsupported BF16
+or retrying FP16 that previously overflowed. This path has not yet been measured
+on a physical RTX 2080/Turing GPU or with full model checkpoints. The BF16
+measurements below must not be presented as measurements of this new path.
+
+Local checks: 25 tests passed with CPU PyTorch 2.6.0, diffusers 0.34.0, and
+Accelerate 1.15.0. These include real small UNet, ControlNet and IP-adapter
+models before/after offload, actual small VAE attention equivalence, repeated calls, shared processor aliases, exception
+cleanup followed by retry, and chunked boolean/additive attention masks. Full
+import in the pinned pristine libcom checkout also passes with only this file
+replaced. These establish functionality, not full-checkpoint VRAM fit,
+performance or output quality.
+
+To exercise the same FP32/offload path on a newer GPU for preliminary testing,
+construct `ShadowGenerationModel(low_vram=True, precision="fp32")`. Such a test
+still would not validate Turing-specific kernels or physical 8 GB hardware.
+
+
 ## GPU test (2026-11-12 UTC)
 
 - GPU: NVIDIA RTX PRO 4000 Blackwell, reported total 25,153,044,480 bytes.
@@ -33,8 +54,8 @@ issue was also corrected with an explicit FP32 conversion.
 
 ## Single-file packaging checks
 
-The GPU run used the same implementation before the helpers were moved into
-the replacement file. The final single-file layout was not rerun on the paid
+The original BF16 GPU run used that implementation before the helpers were moved
+into the replacement file. The later Turing changes are covered separately above. The final single-file layout was not rerun on the paid
 GPU. Its model class, SDPA functions, offload/precision helpers and downloader
 were checked by AST comparison against that validated implementation; their
 executable definitions are unchanged.

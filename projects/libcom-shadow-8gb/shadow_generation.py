@@ -44,6 +44,13 @@ def model_stage(model, device, enabled):
     This intentionally trades PCIe transfer time for memory. It is not safe to
     call the same model instance concurrently. CPU execution needs no moves.
     """
+    if getattr(model, "_shadow_sequential_offload", False):
+        try:
+            yield model
+        except BaseException:
+            _release_offloaded_weights(model)
+            raise
+        return
     offload = enabled and device.type == "cuda"
     try:
         if offload:
@@ -54,10 +61,11 @@ def model_stage(model, device, enabled):
             model.to("cpu")
 
 def resolve_weight_dtype(device, low_vram, precision="auto"):
-    """BF16 avoids overflow observed with the supplied SDXL shadow weights.
+    """Prefer BF16 on Ampere+, stable FP32 on older CUDA devices and CPU.
 
-    FP16 is an explicit experimental option, not a reliable default. Ampere or
-    newer NVIDIA hardware is required for the tested low-memory BF16 path.
+    FP16 remains experimental because the supplied weights overflowed in tests.
+    CUDA FP32 low-memory inference uses sequential CPU offload, not full-model
+    GPU residency. Turing runtime and memory still require hardware validation.
     """
     choices = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
     if precision not in ("auto", *choices):
@@ -67,13 +75,49 @@ def resolve_weight_dtype(device, low_vram, precision="auto"):
             raise ValueError("CPU inference requires precision='auto' or 'fp32'")
         return torch.float32
     if precision == "auto":
-        precision = "bf16" if low_vram else "fp32"
+        precision = "bf16" if low_vram and torch.cuda.get_device_capability(device)[0] >= 8 else "fp32"
     if precision == "bf16" and torch.cuda.get_device_capability(device)[0] < 8:
-        raise ValueError("BF16 low-memory inference requires NVIDIA Ampere or newer. "
-                         "Use low_vram=False for FP32 (more VRAM); FP16 is experimental.")
+        raise ValueError("BF16 requires NVIDIA Ampere or newer. "
+                         "Use low_vram=True, precision='auto' for the FP32 sequential-offload fallback.")
     return choices[precision]
 
-def _sdpa_attention(attn, query, key, value, attention_mask=None):
+
+def _release_offloaded_weights(model):
+    """Restore CPU tensors and reinstall hooks after an interrupted forward.
+
+    Never call post_forward on hooks that may not have run pre_forward: their
+    transient state may be uninitialized. Use Accelerate's detach API instead.
+    """
+    from accelerate import cpu_offload
+    from accelerate.hooks import remove_hook_from_module
+    roots = getattr(model, "_shadow_offload_roots", (model,))
+    device = model._shadow_offload_device
+    for root in roots:
+        remove_hook_from_module(root, recurse=True)
+    for root in roots:
+        cpu_offload(root, execution_device=device, offload_buffers=True)
+
+
+def install_sequential_offload(unet, controlnet, image_proj_model, ip_adapter, device):
+    """Keep FP32 weights in CPU RAM, moving only called layers to the device.
+
+    Hook the UNet once, not the parent adapter: adapter_modules aliases the
+    processors already registered under the UNet. Never .to() hooked models.
+    """
+    try:
+        from accelerate import cpu_offload
+    except ImportError as exc:
+        raise ImportError("Turing/FP32 low-memory mode needs accelerate. Install it with pip install accelerate.") from exc
+    for model in (unet, controlnet, image_proj_model):
+        cpu_offload(model, execution_device=device, offload_buffers=True)
+        model._shadow_sequential_offload = True
+        model._shadow_offload_roots = (model,)
+        model._shadow_offload_device = device
+    ip_adapter._shadow_sequential_offload = True
+    ip_adapter._shadow_offload_roots = (unet, image_proj_model)
+    ip_adapter._shadow_offload_device = device
+
+def _sdpa_attention(attn, query, key, value, attention_mask=None, query_chunk_size=None):
     """Use SDPA without materializing or retaining attention probabilities.
 
     Query scaling also supports PyTorch 2.0, before SDPA's ``scale`` keyword.
@@ -102,9 +146,19 @@ def _sdpa_attention(attn, query, key, value, attention_mask=None):
                 raise ValueError("Attention mask batch dimension does not match attention inputs")
         if attention_mask.dtype != torch.bool:
             attention_mask = attention_mask.to(query.dtype)
-    hidden_states = F.scaled_dot_product_attention(
-        query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-    )
+    if query_chunk_size is not None and query_chunk_size < 1:
+        raise ValueError("query_chunk_size must be positive")
+    chunk_size = query_length if query_chunk_size is None else query_chunk_size
+    chunks = []
+    for start in range(0, query_length, chunk_size):
+        mask = attention_mask
+        if mask is not None and mask.shape[-2] != 1:
+            mask = mask[..., start:start + chunk_size, :]
+        chunks.append(F.scaled_dot_product_attention(
+            query[..., start:start + chunk_size, :], key, value,
+            attn_mask=mask, dropout_p=0.0, is_causal=False
+        ))
+    hidden_states = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=-2)
     return hidden_states.transpose(1, 2).reshape(batch_size, query_length, inner_dim).to(original_dtype)
 
 def _sdpa_processor(processor, attn, hidden_states, encoder_hidden_states, attention_mask, temb):
@@ -140,11 +194,13 @@ def _sdpa_processor(processor, attn, hidden_states, encoder_hidden_states, atten
         attention_mask, encoder_hidden_states.shape[1], batch_size
     )
     hidden_states = _sdpa_attention(
-        attn, query, attn.to_k(encoder_hidden_states), attn.to_v(encoder_hidden_states), attention_mask
+        attn, query, attn.to_k(encoder_hidden_states), attn.to_v(encoder_hidden_states), attention_mask,
+        getattr(processor, "query_chunk_size", None)
     )
     if ip_hidden_states is not None:
         hidden_states = hidden_states + processor.scale * _sdpa_attention(
-            attn, query, processor.to_k_ip(ip_hidden_states), processor.to_v_ip(ip_hidden_states)
+            attn, query, processor.to_k_ip(ip_hidden_states), processor.to_v_ip(ip_hidden_states),
+            query_chunk_size=getattr(processor, "query_chunk_size", None)
         )
     hidden_states = attn.to_out[1](attn.to_out[0](hidden_states))
     if input_ndim == 4:
@@ -156,10 +212,11 @@ def _sdpa_processor(processor, attn, hidden_states, encoder_hidden_states, atten
 class AttnProcessor2_0(AttnProcessor):
     """PyTorch 2 SDPA variant; legacy :class:`AttnProcessor` remains available."""
 
-    def __init__(self, hidden_size=None, cross_attention_dim=None):
+    def __init__(self, hidden_size=None, cross_attention_dim=None, query_chunk_size=None):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch >= 2.0")
         super().__init__(hidden_size, cross_attention_dim)
+        self.query_chunk_size = query_chunk_size
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, temb=None, *args, **kwargs):
@@ -173,12 +230,13 @@ class IPAttnProcessor2_0(IPAttnProcessor):
     SDPA may choose a math fallback on unsupported devices or input shapes.
     """
 
-    def __init__(self, hidden_size, cross_attention_dim=None, scale=1.0, num_tokens=64):
+    def __init__(self, hidden_size, cross_attention_dim=None, scale=1.0, num_tokens=64, query_chunk_size=None):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("IPAttnProcessor2_0 requires PyTorch >= 2.0")
         if num_tokens <= 0:
             raise ValueError("num_tokens must be positive")
         super().__init__(hidden_size, cross_attention_dim, scale, num_tokens)
+        self.query_chunk_size = query_chunk_size
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, temb=None, *args, **kwargs):
@@ -665,6 +723,14 @@ class ShadowGenerationModel:
         self.low_vram = low_vram
         self.load_device = torch.device("cpu") if low_vram else self.device
         self.weight_dtype = resolve_weight_dtype(self.device, low_vram, precision)
+        self.sequential_cpu_offload = low_vram and self.device.type == "cuda" and self.weight_dtype == torch.float32
+        if self.sequential_cpu_offload:
+            # Fail before downloading/loading any weights if the optional hook dependency is missing.
+            try:
+                from accelerate import cpu_offload
+            except ImportError as exc:
+                raise ImportError("FP32 low-memory mode requires accelerate: pip install accelerate") from exc
+        self.attention_query_chunk_size = 128 if self.sequential_cpu_offload else None
         self.post_device = torch.device("cpu") if low_vram else self.device
 
         
@@ -755,7 +821,7 @@ class ShadowGenerationModel:
                 block_id = int(name[len("down_blocks.")])
                 hidden_size = self.unet.config.block_out_channels[block_id]
             if cross_attention_dim is None:
-                attn_procs[name] = (AttnProcessor2_0() if low_vram else AttnProcessor())
+                attn_procs[name] = (AttnProcessor2_0(query_chunk_size=self.attention_query_chunk_size) if low_vram else AttnProcessor())
             else:
                 layer_name = name.split(".processor")[0]
                 weights = {
@@ -763,6 +829,8 @@ class ShadowGenerationModel:
                     "to_v_ip.weight": unet_sd[layer_name + ".to_v.weight"],
                 }
                 attn_procs[name] = (IPAttnProcessor2_0 if low_vram else IPAttnProcessor)(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, num_tokens=num_tokens)
+                if low_vram:
+                    attn_procs[name].query_chunk_size = self.attention_query_chunk_size
                 attn_procs[name].load_state_dict(weights)
         self.unet.set_attn_processor(attn_procs)
 
@@ -788,6 +856,13 @@ class ShadowGenerationModel:
         self.post_model = self.post_model.to(self.post_device)
         self.post_model.eval()
         self.post_model.requires_grad_(False)
+        if self.sequential_cpu_offload:
+            # Float32 SDPA on Turing may select the quadratic math kernel.
+            # Slice the queries in all three attention-bearing models.
+            self.controlnet.set_attn_processor(AttnProcessor2_0(query_chunk_size=128))
+            self.vae.set_attn_processor(AttnProcessor2_0(query_chunk_size=128))
+            install_sequential_offload(self.unet, self.controlnet, self.image_proj_model,
+                                       self.ip_adapter, self.device)
 
     def post_process(self, decoded, shadowfree_img, object_mask):
         """
