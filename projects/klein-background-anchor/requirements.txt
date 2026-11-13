@@ -1,0 +1,12 @@
+# Install CUDA-enabled PyTorch separately for your platform; RTX 2080 requires sm_75.
+# Do not replace a working CUDA installation blindly. A separate venv is recommended.
+torch>=2.4
+diffusers==0.43.0
+transformers==5.22.2
+accelerate==1.15.0
+bitsandbytes==0.50.2
+numpy>=1.26,<3
+Pillow>=10
+scipy>=1.11
+safetensors>=0.4
+sentencepiece>=0.2
